@@ -149,26 +149,27 @@ def configure_lxd_block():
         log('/var/lib/lxd already configured, skipping')
         return
 
-    lxd_block_device = config('block-device')
-    if not lxd_block_device:
-        log('block device is not provided - skipping')
+    lxd_block_devices = config('block-devices')
+    lxd_loopback_device = config('loopback-device')
+
+    if not lxd_block_devices and not lxd_loopback_device:
+        log('block device or loopback device not provided - skipping')
         return
 
     dev = None
-    if lxd_block_device.startswith('/dev/'):
-        dev = lxd_block_device
-    elif lxd_block_device.startswith('/'):
-        log('Configuring loopback device for use with LXD')
-        _bd = lxd_block_device.split('|')
-        if len(_bd) == 2:
-            dev, size = _bd
-        else:
-            dev = lxd_block_device
-            size = DEFAULT_LOOPBACK_SIZE
-        dev = ensure_loopback_device(dev, size)
+    if lxd_block_devices:
+        # NOTE: The block devices can be a list. Since that logic is not in
+        # just yet but the API has to be guaranteed, split the list and only
+        # use the first provided block device as previously.
+        dev = lxd_block_devices.split(" ")[0]
+
+    # NOTE: If the user provided a loopback device for testing, override the
+    # device specified.
+    if lxd_loopback_device:
+        dev = _configure_loopback_device(lxd_loopback_device)
 
     if not dev or not is_block_device(dev):
-        log('Invalid block device provided: %s' % lxd_block_device)
+        log('Invalid block device provided: %s' % lxd_block_devices)
         return
 
     # NOTE: check overwrite and ensure its only execute once.
@@ -216,6 +217,19 @@ def configure_lxd_block():
         # The LVM thinpool logical volume is lazily created, either on
         # image import or container creation. This will force LV creation.
         create_and_import_busybox_image()
+
+
+def _configure_loopback_device(device, ensure_loopback=ensure_loopback_device):
+    """Create a loopback device at the path provided.
+    """
+    log('Configuring loopback device {} for use with LXD'.format(device))
+    size = DEFAULT_LOOPBACK_SIZE
+
+    _bd = device.split('|')
+    if len(_bd) == 2:
+        device, size = _bd
+    ensure_loopback(device, size)
+    return device
 
 
 def create_and_import_busybox_image():
