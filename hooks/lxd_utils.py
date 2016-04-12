@@ -74,6 +74,8 @@ LXD_GIT = 'github.com/lxc/lxd'
 DEFAULT_LOOPBACK_SIZE = '10G'
 PW_LENGTH = 16
 
+# The volume group name to use for LXD.
+LXD_VOLUME_GROUP = "lxd_vg"
 
 def install_lxd():
     '''Install LXD'''
@@ -143,80 +145,172 @@ def configure_lxd_source(user='ubuntu'):
 
 
 def configure_lxd_block():
-    '''Configure a block device for use by LXD for containers'''
+    '''Configure a block device for use by LXD for containers.'''
     log('Configuring LXD container storage')
     if filesystem_mounted('/var/lib/lxd'):
         log('/var/lib/lxd already configured, skipping')
         return
 
+    # Gather all of the config-dependent information first.
     lxd_block_devices = config('block-devices')
-    lxd_loopback_device = config('loopback-device')
+    lxd_loopback_device = config("loopback_device")
+    lxd_overwrite = config('overwrite')
+    lxd_storage_type = config('storage-type')
 
-    if not lxd_block_devices and not lxd_loopback_device:
-        log('block device or loopback device not provided - skipping')
+    # From this point we have a valid list of devices in "devices",
+    # irrespective of whether they come from a loopback or real block devices.
+    devices = _get_devices_set(lxd_block_devices, lxd_loopback_device)
+    if not devices:
+        log('Block device or loopback not provided - skipping. LXD will use '
+            'the filesystem\'s /var/lib/lxd/ for storage.')
         return
 
-    dev = None
-    if lxd_block_devices:
-        # NOTE: The block devices can be a list. Since that logic is not in
-        # just yet but the API has to be guaranteed, split the list and only
-        # use the first provided block device as previously.
-        dev = lxd_block_devices.split(" ")[0]
-
-    # NOTE: If the user provided a loopback device for testing, override the
-    # device specified.
-    if lxd_loopback_device:
-        dev = _configure_loopback_device(lxd_loopback_device)
-
-    if not dev or not is_block_device(dev):
-        log('Invalid block device provided: %s' % lxd_block_devices)
-        return
-
-    # NOTE: check overwrite and ensure its only execute once.
+    # NOTE: check overwrite and ensure its only executed once (this code is run
+    # on i.e., config-changed
     db = kv()
-    if config('overwrite') and not db.get('scrubbed', False):
-        clean_storage(dev)
+    if lxd_overwrite and not db.get('scrubbed', False):
+        for dev in devices:
+            # If we were told to overwrite, zap all block devices.
+            clean_storage(dev)
         db.set('scrubbed', True)
         db.flush()
 
     if not os.path.exists('/var/lib/lxd'):
         mkdir('/var/lib/lxd')
 
-    if config('storage-type') == 'btrfs':
-        status_set('maintenance',
-                   'Configuring btrfs container storage')
-        service_stop('lxd')
-        cmd = ['mkfs.btrfs', '-f', dev]
-        check_call(cmd)
-        mount(dev,
-              '/var/lib/lxd',
-              options='user_subvol_rm_allowed',
-              persist=True,
-              filesystem='btrfs')
-        cmd = ['btrfs', 'quota', 'enable', '/var/lib/lxd']
-        check_call(cmd)
-        service_start('lxd')
-    elif config('storage-type') == 'lvm':
-        if (is_lvm_physical_volume(dev) and
-                list_lvm_volume_group(dev) == 'lxd_vg'):
-            log('Device already configured for LVM/LXD, skipping')
-            return
-        status_set('maintenance',
-                   'Configuring LVM container storage')
-        # Enable and startup lvm2-lvmetad to avoid extra output
-        # in lvm2 commands, which confused lxd.
-        cmd = ['systemctl', 'enable', 'lvm2-lvmetad']
-        check_call(cmd)
-        cmd = ['systemctl', 'start', 'lvm2-lvmetad']
-        check_call(cmd)
-        create_lvm_physical_volume(dev)
-        create_lvm_volume_group('lxd_vg', dev)
-        cmd = ['lxc', 'config', 'set', 'storage.lvm_vg_name', 'lxd_vg']
-        check_call(cmd)
+    if lxd_storage_type == 'btrfs':
+        _configure_btrfs(devices)
+    elif lxd_storage_type == 'lvm':
+        _configure_lvm(devices)
+    else:
+        log("No storage type specified! Using whatever is in /var/lib/lxd for "
+            "storage.")
 
-        # The LVM thinpool logical volume is lazily created, either on
-        # image import or container creation. This will force LV creation.
-        create_and_import_busybox_image()
+
+def _configure_loopback_device(device, ensure_loopback=ensure_loopback_device):
+    """Create a loopback device at the path provided.
+    """
+    log('Configuring loopback device {} for use with LXD'.format(device))
+    size = DEFAULT_LOOPBACK_SIZE
+
+    _bd = device.split('|')
+    if len(_bd) == 2:
+        device, size = _bd
+    ensure_loopback(device, size)
+
+
+def _get_devices_set(block_devices, loopback_device,
+                     is_block_device=is_block_device,
+                     configure_loopback=_configure_loopback_device):
+    """Get a set of valid devices to use for storage.
+
+    This function returns a set() of block devices we can use for storage, no
+    matter if they come from the list of block storage devices passed to the
+    charm or if they have been built using a loopback devices.
+
+    The returned devices are guaranteed to exist.
+    """
+    devices = set()  # We might be passed duplicates by error.
+
+    if not block_devices and not loopback_device:
+        return devices  # return an empty set
+
+    if block_devices:
+        list_of_devices = block_devices.split(" ")
+        # Filter out devices that are not found or not a block device.
+        for dev in list_of_devices:
+            if is_block_device(dev):
+                devices.add(dev)
+            else:
+                log("Provided block device {} invalid or not found. "
+                    "Skipping.".format(dev))
+
+    if loopback_device:
+        configure_loopback(loopback_device)
+        devices.add(loopback_device)
+    return devices
+
+
+def _configure_btrfs(devices, check_call=check_call):
+    """Take the necessary steps to let LXD use btrfs as storage backend.
+    """
+    status_set('maintenance', 'Configuring btrfs container storage')
+    service_stop('lxd')
+
+    cmd = ['mkfs.btrfs', '-f'] + list(devices)
+
+    check_call(cmd)
+    mount(devices[0],  # Any one of the devices can be used to mount.
+            '/var/lib/lxd',
+            options='user_subvol_rm_allowed',
+            persist=True,
+            filesystem='btrfs')
+
+    cmd = ['btrfs', 'quota', 'enable', '/var/lib/lxd']
+    check_call(cmd)
+    service_start('lxd')
+
+
+def _configure_lvm(devices):
+    """Take the necessary steps to let LXD use LVM as storage backend.
+    """
+    ready_devices = set()
+
+    # Filter out devices that are already an LVM PV, part of the LXD VG
+    for device in devices:
+        if (is_lvm_physical_volume(device) and
+                list_lvm_volume_group(device) == LXD_VOLUME_GROUP):
+            log('Device "{}" already configured for LVM/LXD, skipping'
+                ''.format(device))
+            continue
+        ready_devices.add(device)
+
+    if len(ready_devices) == 0:
+        # We were passed only LVM physical volumes that already are part of
+        # the LXD VG Noop.
+        return
+
+    status_set('maintenance',
+            'Configuring LVM container storage')
+
+    # Enable and startup lvm2-lvmetad to avoid extra output
+    # in lvm2 commands, which confuses lxd.
+    cmd = ['systemctl', 'enable', 'lvm2-lvmetad']
+    check_call(cmd)
+    cmd = ['systemctl', 'start', 'lvm2-lvmetad']
+    check_call(cmd)
+
+    # Make all the ready_devices LVM physical volumes.
+    for device in ready_devices:
+        log("Creating physical LVM volume on {}.".format(device))
+        create_lvm_physical_volume(device)
+
+    # Does the volume group already exist? If so, we need to extend it and not
+    # create it.
+    vg_exists = LXD_VOLUME_GROUP in check_output(["vgs"])
+    if not vg_exists:
+        # No volume group exists - let's just go ahead and pass all our devices
+        # to it.
+        # NOTE: The charmhelpers volume group creation helper accepts a single
+        # block device. Since it's a very thin wrapper, do it here.
+        log("Creating volume group '{}'".format(LXD_VOLUME_GROUP))
+        check_call(['vgcreate', LXD_VOLUME_GROUP] + list(devices))
+    else:
+        # Our volume group already exists, and some more ready disks are to be
+        # used as well. Let's vgextend the existing group.
+        log("Volume group '{}' already exists.".format(LXD_VOLUME_GROUP))
+        for device in ready_devices:
+            log("Extending volume group '{}' with {}"
+                "".format(LXD_VOLUME_GROUP, device))
+            check_call(['vgextend', LXD_VOLUME_GROUP, device])
+
+    # Set the LXD config to use our volume group.
+    cmd = ['lxc', 'config', 'set', 'storage.lvm_vg_name', LXD_VOLUME_GROUP]
+    check_call(cmd)
+
+    # The LVM thinpool logical volume is lazily created, either on
+    # image import or container creation. This will force LV creation.
+    create_and_import_busybox_image()
 
 
 def _configure_loopback_device(device, ensure_loopback=ensure_loopback_device):
