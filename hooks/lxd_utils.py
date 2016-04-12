@@ -187,7 +187,9 @@ def configure_lxd_block():
             "storage.")
 
 
-def _configure_loopback_device(device, ensure_loopback=ensure_loopback_device):
+def _configure_loopback_device(device,
+                               log=log,
+                               ensure_loopback=ensure_loopback_device):
     """Create a loopback device at the path provided.
     """
     log('Configuring loopback device {} for use with LXD'.format(device))

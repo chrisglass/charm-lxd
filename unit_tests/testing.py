@@ -122,3 +122,22 @@ def patch_open():
 
     with patch('__builtin__.open', stub_open):
         yield mock_open, mock_file
+
+
+class FunctionStub(object):
+    """
+    A lightweight function stub that stores what it's being called with.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+    def assert_called_once_with(self, *args, **kwargs):
+        assert len(self.calls) == 1
+        the_call = self.calls[0]
+        if the_call != (args, kwargs):
+            raise AssertionError(
+                "{} is not the expected {}".format(the_call, (args, kwargs)))

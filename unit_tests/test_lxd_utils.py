@@ -3,6 +3,7 @@ import mock
 
 import lxd_utils
 import testing
+import unittest
 
 
 class TestLXDUtilsDeterminePackages(testing.CharmTestCase):
@@ -84,3 +85,36 @@ class TestLXDUtilsCreateAndImportBusyboxImage(testing.CharmTestCase):
         Popen_rv.stdout.read.assert_called_once_with()
         stat.assert_called_with('/bin/busybox')
         mock_open.assert_called_once_with('/bin/busybox', 'rb')
+
+
+class ConfigurateLoopbackDeviceTest(unittest.TestCase):
+
+    def test_configure_loopback_device_no_size(self):
+        """
+        Calling configure_loopback_devices without a size specified creates
+        a loopback device of the default size.
+        """
+        stub_log = testing.FunctionStub()
+        stub_block_device = testing.FunctionStub()
+        lxd_utils._configure_loopback_device(
+            "/mnt/something", stub_log, stub_block_device)
+        stub_log.assert_called_once_with(
+            "Configuring loopback device /mnt/something for use with LXD")
+        stub_block_device.assert_called_once_with(
+            "/mnt/something", lxd_utils.DEFAULT_LOOPBACK_SIZE)
+
+    def test_configure_loopback_device_custom_size(self):
+        """
+        Calling configure_loopback_devices with a size creates a loopback
+        device of the given size.
+        """
+        device = "/mnt/something|5G"
+
+        stub_log = testing.FunctionStub()
+        stub_block_device = testing.FunctionStub()
+        lxd_utils._configure_loopback_device(
+            device, stub_log, stub_block_device)
+        stub_log.assert_called_once_with(
+            "Configuring loopback device /mnt/something|5G for use with LXD")
+        stub_block_device.assert_called_once_with(
+            "/mnt/something", "5G")
