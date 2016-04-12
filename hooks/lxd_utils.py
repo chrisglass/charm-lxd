@@ -39,7 +39,6 @@ from charmhelpers.contrib.storage.linux.loopback import (
     ensure_loopback_device
 )
 from charmhelpers.contrib.storage.linux.lvm import (
-    create_lvm_volume_group,
     create_lvm_physical_volume,
     list_lvm_volume_group,
     is_lvm_physical_volume,
@@ -199,11 +198,13 @@ def _configure_loopback_device(device,
     if len(_bd) == 2:
         device, size = _bd
     ensure_loopback(device, size)
+    return device
 
 
 def _get_devices_set(block_devices, loopback_device,
                      is_block_device=is_block_device,
-                     configure_loopback=_configure_loopback_device):
+                     configure_loopback=_configure_loopback_device,
+                     log=log):
     """Get a set of valid devices to use for storage.
 
     This function returns a set() of block devices we can use for storage, no
@@ -228,8 +229,9 @@ def _get_devices_set(block_devices, loopback_device,
                     "Skipping.".format(dev))
 
     if loopback_device:
-        configure_loopback(loopback_device)
-        devices.add(loopback_device)
+        # Get the loopback device's path, without the size information
+        loopback_path = configure_loopback(loopback_device)
+        devices.add(loopback_path)
     return devices
 
 
